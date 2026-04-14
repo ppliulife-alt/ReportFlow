@@ -42,6 +42,11 @@ class Config:
     # 微信公众号 AppSecret
     WX_GZH_APPSECRET = "YOUR_WX_GZH_APPSECRET"
 
+    # openid 单发测试用配置
+    WX_GZH_TEST_APPID = "YOUR_WX_GZH_TEST_APPID"
+    WX_GZH_TEST_APPSECRET = "YOUR_WX_GZH_TEST_APPSECRET"
+    WX_GZH_TEST_OPENID = "YOUR_WX_GZH_TEST_OPENID"
+
     # 微信公众号接口基础地址
     WX_GZH_API_BASE = "https://api.weixin.qq.com"
 
@@ -95,4 +100,22 @@ class Config:
 9. “行情变化原因”“后续走势判断”“风险提示”每部分控制在 2-4 句
 10. 语言简洁、专业、客观，不要口语化，不要废话
 11. 结尾必须补一段“【简要结论】”，用一句话概括整体判断
+"""
+
+    # openid 单发使用的短报 Prompt
+    # 客服文本消息长度有限，因此这里单独压缩成更短版本
+    GZH_OPENID_REPORT_PROMPT = """你是一个农产品行情分析助手。请围绕“金乡大蒜今日行情与后续走势”输出一篇适合微信公众号客服消息单发的纯文本简报。
+
+要求：
+1. 第一行必须输出标题，格式固定为：金乡大蒜行情简报（YYYY年M月D日）
+2. 全文总字数控制在 280-420 字
+3. 全文分为四部分：
+【今日报价】
+【行情原因】
+【后续走势】
+【结论】
+4. 使用纯文本，不要使用 Markdown
+5. 每一部分单独成段，适合手机快速阅读
+6. 报价部分最多保留 4-5 行关键信息
+7. 语言简洁、专业、客观
 """

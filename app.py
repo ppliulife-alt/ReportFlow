@@ -1,5 +1,7 @@
 from datetime import datetime
 from time import perf_counter
+import json
+import re
 
 import requests
 from flask import Flask, jsonify, request
@@ -20,6 +22,40 @@ class AppError(Exception):
         super().__init__(message)
         self.message = message
         self.status_code = status_code
+
+
+def normalize_message_content(content):
+    """发送前做一层文本归一化，避免 \\uXXXX 被原样发到微信。"""
+    if not content:
+        return content
+
+    # 只有命中明显的 unicode 转义格式时才尝试解码，避免误伤正常中文。
+    if re.search(r"\\u[0-9a-fA-F]{4}", content):
+        try:
+            return content.encode("utf-8").decode("unicode_escape")
+        except UnicodeDecodeError:
+            return content
+
+    return content
+
+
+def trim_utf8_bytes(content, max_bytes=1800):
+    """按 UTF-8 字节数裁剪文本，避免微信文本消息超长。"""
+    if not content:
+        return content
+
+    encoded = content.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return content
+
+    trimmed = encoded[:max_bytes]
+    while trimmed:
+        try:
+            return trimmed.decode("utf-8").rstrip() + "\n\n【提示】内容较长，已自动精简发送。"
+        except UnicodeDecodeError:
+            trimmed = trimmed[:-1]
+
+    return content[:200]
 
 
 def format_wechat_report(text):
@@ -89,6 +125,26 @@ def format_wechat_report(text):
     return "\n".join(cleaned).strip()
 
 
+def format_wechat_openid_report(text):
+    """把 openid 单发内容整理成更短、更紧凑的手机消息格式。"""
+    formatted = format_wechat_report(text)
+    if not formatted:
+        return formatted
+
+    replacements = {
+        "【行情变化原因】": "【行情原因】",
+        "【后续走势判断】": "【后续走势】",
+        "【风险提示】": "【结论】",
+        "【简要结论】": "【结论】",
+    }
+
+    for old, new in replacements.items():
+        formatted = formatted.replace(old, new)
+
+    # 最终再做一次长度裁剪，确保客服文本消息可发。
+    return trim_utf8_bytes(formatted, max_bytes=1800)
+
+
 def validate_doubao_config():
     """校验豆包必要配置。"""
     if not Config.DOUBAO_API_KEY:
@@ -103,6 +159,16 @@ def validate_gzh_config():
         raise AppError("WX_GZH_APPID is not configured", 500)
     if not Config.WX_GZH_APPSECRET:
         raise AppError("WX_GZH_APPSECRET is not configured", 500)
+
+
+def validate_gzh_test_config():
+    """校验 openid 单发测试配置。"""
+    if not Config.WX_GZH_TEST_APPID:
+        raise AppError("WX_GZH_TEST_APPID is not configured", 500)
+    if not Config.WX_GZH_TEST_APPSECRET:
+        raise AppError("WX_GZH_TEST_APPSECRET is not configured", 500)
+    if not Config.WX_GZH_TEST_OPENID:
+        raise AppError("WX_GZH_TEST_OPENID is not configured", 500)
 
 
 def call_doubao(question):
@@ -192,6 +258,8 @@ def push_to_qywx(ai_result):
     if not Config.WECHAT_WEBHOOK_URL:
         return False
 
+    ai_result = normalize_message_content(ai_result)
+
     payload = {
         "msgtype": "text",
         "text": {
@@ -202,7 +270,8 @@ def push_to_qywx(ai_result):
     try:
         response = requests.post(
             Config.WECHAT_WEBHOOK_URL,
-            json=payload,
+            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            headers={"Content-Type": "application/json; charset=utf-8"},
             timeout=30,
         )
     except requests.Timeout as exc:
@@ -229,15 +298,21 @@ def push_to_qywx(ai_result):
 
 def get_gzh_access_token():
     """获取微信公众号 access_token。"""
-    validate_gzh_config()
+    return get_gzh_access_token_by_credentials(Config.WX_GZH_APPID, Config.WX_GZH_APPSECRET)
+
+
+def get_gzh_access_token_by_credentials(appid, appsecret):
+    """按指定 AppID/AppSecret 获取公众号 access_token。"""
+    if not appid or not appsecret:
+        raise AppError("appid or appsecret is not configured", 500)
 
     try:
         response = requests.get(
             f"{Config.WX_GZH_API_BASE}/cgi-bin/token",
             params={
                 "grant_type": "client_credential",
-                "appid": Config.WX_GZH_APPID,
-                "secret": Config.WX_GZH_APPSECRET,
+                "appid": appid,
+                "secret": appsecret,
             },
             timeout=30,
         )
@@ -269,6 +344,7 @@ def get_gzh_access_token():
 
 def broadcast_gzh_text(content):
     """调用公众号 sendall 接口，对全体粉丝群发纯文本消息。"""
+    content = normalize_message_content(content)
     access_token = get_gzh_access_token()
     payload = {
         "filter": {
@@ -284,7 +360,8 @@ def broadcast_gzh_text(content):
         response = requests.post(
             f"{Config.WX_GZH_API_BASE}/cgi-bin/message/mass/sendall",
             params={"access_token": access_token},
-            json=payload,
+            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            headers={"Content-Type": "application/json; charset=utf-8"},
             timeout=60,
         )
     except requests.Timeout as exc:
@@ -306,6 +383,51 @@ def broadcast_gzh_text(content):
     if result.get("errcode") != 0:
         raise AppError(
             f"WeChat Official Account broadcast failed: {result.get('errmsg', result)}",
+            502,
+        )
+
+    return result
+
+
+def send_gzh_openid_text(openid, content, appid, appsecret):
+    """按 openid 单发公众号客服文本消息。"""
+    content = normalize_message_content(content)
+    access_token = get_gzh_access_token_by_credentials(appid, appsecret)
+    payload = {
+        "touser": openid,
+        "msgtype": "text",
+        "text": {
+            "content": content,
+        },
+    }
+
+    try:
+        response = requests.post(
+            f"{Config.WX_GZH_API_BASE}/cgi-bin/message/custom/send",
+            params={"access_token": access_token},
+            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            headers={"Content-Type": "application/json; charset=utf-8"},
+            timeout=30,
+        )
+    except requests.Timeout as exc:
+        raise AppError("WeChat Official Account openid send request timed out", 504) from exc
+    except requests.RequestException as exc:
+        raise AppError(f"WeChat Official Account openid send request failed: {exc}", 502) from exc
+
+    if not response.ok:
+        raise AppError(
+            f"WeChat Official Account openid send failed with status {response.status_code}",
+            502,
+        )
+
+    try:
+        result = response.json()
+    except ValueError as exc:
+        raise AppError("Failed to parse WeChat Official Account openid send response", 502) from exc
+
+    if result.get("errcode") != 0:
+        raise AppError(
+            f"WeChat Official Account openid send failed: {result.get('errmsg', result)}",
             502,
         )
 
@@ -429,6 +551,39 @@ def gzh_report_push():
             "dry_run": False,
             "question": question,
             "result": ai_result,
+            "duration_ms": duration_ms,
+            "wechat_result": result,
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+    )
+
+
+@app.route("/gzh/openid/send", methods=["POST"])
+def gzh_openid_send():
+    """接口4：固定问题 -> 豆包生成报告 -> 按 openid 单发公众号客服文本消息。"""
+    validate_gzh_test_config()
+    validate_doubao_config()
+
+    openid = Config.WX_GZH_TEST_OPENID
+    if not openid:
+        raise AppError("openid cannot be empty", 400)
+
+    question = Config.FIXED_GARLIC_REPORT_QUESTION
+    content, duration_ms = call_doubao_with_prompt(Config.GZH_OPENID_REPORT_PROMPT, question)
+    content = format_wechat_openid_report(content)
+
+    result = send_gzh_openid_text(
+        openid,
+        content,
+        Config.WX_GZH_TEST_APPID,
+        Config.WX_GZH_TEST_APPSECRET,
+    )
+    return jsonify(
+        {
+            "success": True,
+            "question": question,
+            "openid": openid,
+            "content": content,
             "duration_ms": duration_ms,
             "wechat_result": result,
             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
